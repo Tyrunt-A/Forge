@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Logs
+forge_debug.log
+*.log
+
+# Background image (user-provided, not distributed)
+fondo.jpg
+Arcane.jpg
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+*.exe
+
+# Local launchers
+*.vbs
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
