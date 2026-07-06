@@ -44,7 +44,7 @@ else:
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 RIOT_API_KEY      = os.getenv("RIOT_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-FORGE_MODEL       = os.getenv("FORGE_MODEL", "claude-sonnet-4-20250514")
+FORGE_MODEL       = os.getenv("FORGE_MODEL", "claude-sonnet-4-6")
 FONDO_PATH        = os.path.join(BASE_DIR, "fondo.jpg")
 
 COLOR_ENTRY_BG      = "#1a1a2e"
