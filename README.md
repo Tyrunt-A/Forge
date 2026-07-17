@@ -5,7 +5,7 @@ Forge is a desktop coaching app for League of Legends. It analyzes your matchup 
 
 Stats sites tell you *what happened*. Forge tells you *what to do about it*.
 
-<!-- DEMO GIF HERE: ![Forge demo](docs/demo.gif) -->
+![Forge demo](docs/demo.gif)
 
 ---
 
@@ -46,7 +46,7 @@ Forge's coach persona is deliberately harsh: it points out what you're doing wro
 ### Install
 
 ```bash
-pip install anthropic requests pillow python-dotenv speechrecognition pyttsx3
+pip install anthropic requests pillow python-dotenv
 ```
 
 ### Configure
@@ -58,7 +58,7 @@ Optional: place any `fondo.jpg` image next to the script to use as background. W
 ### Run
 
 ```bash
-py -3.12 lol_coach_API.py
+py -3.12 forge.py
 ```
 
 Or download the portable `.exe` from [Releases](../../releases) — no Python required. Just place your `.env` file next to it.
@@ -68,7 +68,6 @@ Or download the portable `.exe` from [Releases](../../releases) — no Python re
 ## Roadmap
 
 - **Post-Game analysis** — match-by-match decision review using Riot match data: not *what* your stats were, but *why* you lost
-- In-game voice coaching (prototype exists, frozen pending latency work)
 - Community champion nicknames support
 
 ---
