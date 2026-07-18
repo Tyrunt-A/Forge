@@ -23,3 +23,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+ultimo_riot_id.txt
+historial_uso.json
+perfil_manual.json
