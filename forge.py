@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import traceback
 from dotenv import load_dotenv
 
@@ -43,6 +44,85 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 RIOT_API_KEY      = os.getenv("RIOT_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 FORGE_MODEL       = os.getenv("FORGE_MODEL", "claude-sonnet-4-6")
+
+def cargar_perfil_manual():
+    """
+    Carga datos manuales opcionales desde perfil_manual.json (al lado del .exe/script).
+    Útil cuando la cuenta activa no tiene aún historial suficiente en la API de Riot
+    (cuenta nueva en un servidor, cambio de región, etc.) pero el jugador sí tiene
+    datos reales de otra fuente (ej. maestría de una cuenta vieja) que valen la pena
+    darle de contexto a Claude. Si el archivo no existe, simplemente no aporta nada
+    — no rompe el flujo normal.
+    """
+    ruta = os.path.join(BASE_DIR, "perfil_manual.json")
+    if not os.path.exists(ruta):
+        return {}
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"cargar_perfil_manual: error leyendo perfil_manual.json — {e}")
+        return {}
+
+perfil_manual = cargar_perfil_manual()
+
+# ============================================
+# HISTORIAL DE USO (para mostrar "recientes" al abrir la app)
+# ============================================
+_HISTORIAL_PATH = os.path.join(BASE_DIR, "historial_uso.json")
+_HISTORIAL_MAX  = 8
+
+def cargar_historial_uso():
+    if not os.path.exists(_HISTORIAL_PATH):
+        return []
+    try:
+        with open(_HISTORIAL_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"cargar_historial_uso: error leyendo historial — {e}")
+        return []
+
+def guardar_entrada_historial(tipo, texto):
+    """
+    Registra una acción (análisis de Pre-Game o Post-Game) en el historial
+    local, para mostrarla como 'recientes' la próxima vez que se abra Forge.
+    Nunca debe romper el flujo si falla — es solo un plus visual.
+    """
+    try:
+        import datetime
+        historial = cargar_historial_uso()
+        historial.insert(0, {
+            "fecha": datetime.datetime.now().strftime("%d/%m %H:%M"),
+            "tipo":  tipo,   # "pregame" o "postgame"
+            "texto": texto,
+        })
+        historial = historial[:_HISTORIAL_MAX]
+        with open(_HISTORIAL_PATH, "w", encoding="utf-8") as f:
+            json.dump(historial, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"guardar_entrada_historial: error guardando — {e}")
+
+# Recuerda el último Riot ID válido para no tener que escribirlo cada vez
+# que se abre Forge — se guarda apenas la cuenta se confirma como existente.
+_ULTIMO_ID_PATH = os.path.join(BASE_DIR, "ultimo_riot_id.txt")
+
+def cargar_ultimo_riot_id():
+    if not os.path.exists(_ULTIMO_ID_PATH):
+        return ""
+    try:
+        with open(_ULTIMO_ID_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        log(f"cargar_ultimo_riot_id: error leyendo — {e}")
+        return ""
+
+def guardar_ultimo_riot_id(riot_id):
+    try:
+        with open(_ULTIMO_ID_PATH, "w", encoding="utf-8") as f:
+            f.write(riot_id.strip())
+    except Exception as e:
+        log(f"guardar_ultimo_riot_id: error guardando — {e}")
+
 FONDO_PATH        = os.path.join(BASE_DIR, "fondo.jpg")
 
 COLOR_ENTRY_BG      = "#1a1a2e"
@@ -128,6 +208,8 @@ estado_partida = {
 perfil_jugador = {
     "riot_id":          None,  # "Nombre#TAG"
     "puuid":            None,
+    "platform":         None,  # "euw1", "la2", etc. — para construir match IDs a mano
+    "routing":          None,  # "europe", "americas", "asia", "sea" — región detectada
     "nivel":            None,
     "rango":            None,  # "Gold II", "Sin rango", etc.
     "partidas_totales": None,
@@ -177,6 +259,13 @@ def get_champions(version):
     url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/es_ES/champion.json"
     return requests.get(url).json()["data"]
 
+def get_items(version):
+    url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/es_ES/item.json"
+    try:
+        return requests.get(url, timeout=10).json()["data"]
+    except Exception:
+        return {}
+
 # ============================================
 # RIOT API — PERFIL DE JUGADOR
 # ============================================
@@ -187,17 +276,44 @@ RIOT_REGIONS = {
     "oc1":  "sea", "ph2": "sea", "sg2": "sea", "th2": "sea", "tw2": "sea", "vn2": "sea",
 }
 
-# Región dinámica — se detecta automáticamente al cargar el perfil
-_region_platform = os.getenv("RIOT_REGION", "euw1")
+# Región dinámica — se detecta automáticamente al cargar el perfil,
+# a menos que el usuario la fuerce explícitamente vía RIOT_REGION en el .env
+# (útil cuando el "active shard" que reporta Riot está desactualizado,
+# por ejemplo justo después de una transferencia/cambio de servidor).
+_region_forzada  = os.getenv("RIOT_REGION")  # None si no está definida en el .env
+_region_platform = _region_forzada or "euw1"
 _region_routing  = RIOT_REGIONS.get(_region_platform, "europe")
 
 def riot_get(url, params=None):
     headers = {"X-Riot-Token": RIOT_API_KEY}
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    return r.json() if r.status_code == 200 else None
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+    except Exception as e:
+        log(f"riot_get: excepción de red — {e} — url={url}")
+        return None
+    if r.status_code == 200:
+        return r.json()
+    if r.status_code == 403:
+        log(f"riot_get: 403 Forbidden — la API key probablemente expiró o es inválida — url={url}")
+    elif r.status_code == 429:
+        log(f"riot_get: 429 Rate limit excedido — url={url}")
+    elif r.status_code == 404:
+        log(f"riot_get: 404 No encontrado (normal si aún no hay datos) — url={url}")
+    else:
+        log(f"riot_get: status {r.status_code} inesperado — url={url}")
+    return None
 
 def detectar_region(puuid):
-    """Detecta el servidor de LoL donde está activa la cuenta"""
+    """
+    Detecta el servidor de LoL donde está activa la cuenta.
+    Si RIOT_REGION está definida en el .env, se respeta esa región manual
+    y NO se auto-detecta (Riot puede tardar en actualizar el "active shard"
+    tras un cambio de servidor reciente).
+    """
+    if _region_forzada:
+        log(f"detectar_region: usando región forzada por .env — {_region_platform}")
+        return _region_platform, _region_routing
+
     # Intentamos europe primero (más común), luego el resto
     for routing in ["europe", "americas", "asia", "sea"]:
         url = f"https://{routing}.api.riotgames.com/riot/account/v1/active-shards/by-game/lol/by-puuid/{puuid}"
@@ -237,13 +353,383 @@ def obtener_rango(summoner_id, platform):
             return f"{tier} {rank}".strip()
     return "Sin rango clasificatorio"
 
-def obtener_historial(puuid, routing, count=30):
+def obtener_historial(puuid, routing, count=30, queue=None):
+    """
+    Trae IDs de partidas recientes. Si queue=None, trae de cualquier modo
+    (normal, ranked, ARAM, etc.) — necesario para jugadores que no tienen
+    partidas ranked todavía.
+    """
     url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids"
-    return riot_get(url, params={"count": count, "queue": 420}) or []
+    params = {"count": count}
+    if queue is not None:
+        params["queue"] = queue
+    return riot_get(url, params=params) or []
 
 def obtener_detalle_partida(match_id, routing):
     url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id}"
     return riot_get(url)
+
+def obtener_timeline_partida(match_id, routing):
+    url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
+    return riot_get(url)
+
+def extraer_eventos_relevantes(timeline, detalle, participant_id, items_data=None):
+    """
+    Filtra el timeline completo de la partida a solo los eventos que
+    involucran directamente al participante indicado (o le afectan):
+    kills/deaths/asistencias, wards puestos/destruidos por él, objetivos
+    tomados por cualquiera de los dos equipos, estructuras caídas, y sus
+    compras de ítems.
+    Devuelve una lista de strings en orden cronológico, ej: "[8.2min] Pusiste ward".
+    Si algo falla o el timeline no trae lo esperado, devuelve [] sin romper nada
+    — Riot puede cambiar campos del timeline sin previo aviso.
+    """
+    try:
+        participantes = detalle.get("info", {}).get("participants", [])
+        yo = next((p for p in participantes if p.get("participantId") == participant_id), None)
+        if not yo:
+            return []
+        mi_id     = yo.get("participantId")
+        mi_team   = yo.get("teamId")
+        nombre_por_id = {p.get("participantId"): p.get("championName", "?") for p in participantes}
+
+        eventos = []  # lista de (timestamp_ms, texto)
+        frames = timeline.get("info", {}).get("frames", [])
+
+        for frame in frames:
+            for ev in frame.get("events", []):
+                tipo  = ev.get("type")
+                ts_ms = ev.get("timestamp", 0)
+                ts_min = round(ts_ms / 60000, 1)
+                texto = None
+
+                if tipo == "CHAMPION_KILL":
+                    killer   = ev.get("killerId")
+                    victim   = ev.get("victimId")
+                    asist    = ev.get("assistingParticipantIds", []) or []
+                    if mi_id in ([killer, victim] + asist):
+                        kn = nombre_por_id.get(killer, "ejecución de equipo") if killer else "ejecución de equipo"
+                        vn = nombre_por_id.get(victim, "?")
+                        roles = []
+                        if killer == mi_id: roles.append("TÚ mataste")
+                        if victim == mi_id: roles.append("TE MATARON")
+                        if mi_id in asist:  roles.append("diste asistencia")
+                        texto = f"[{ts_min}min] {' / '.join(roles)}: {kn} → {vn}"
+
+                elif tipo == "WARD_PLACED":
+                    if ev.get("creatorId") == mi_id:
+                        wt = ev.get("wardType", "centinela")
+                        texto = f"[{ts_min}min] Pusiste un {wt.lower()}"
+
+                elif tipo == "WARD_KILL":
+                    if ev.get("killerId") == mi_id:
+                        texto = f"[{ts_min}min] Destruiste un centinela enemigo"
+
+                elif tipo == "ITEM_PURCHASED":
+                    if ev.get("participantId") == mi_id:
+                        item_id = ev.get("itemId")
+                        nombre_item = str(item_id)
+                        if items_data:
+                            info_item = items_data.get(str(item_id))
+                            if info_item:
+                                nombre_item = info_item.get("name", str(item_id))
+                        texto = f"[{ts_min}min] Compraste {nombre_item}"
+
+                elif tipo == "ELITE_MONSTER_KILL":
+                    killer_team = ev.get("killerTeamId")
+                    monstruo    = ev.get("monsterType", "objetivo")
+                    equipo_txt  = "Tu equipo" if killer_team == mi_team else "El equipo rival"
+                    texto = f"[{ts_min}min] {equipo_txt} tomó {monstruo}"
+
+                elif tipo == "BUILDING_KILL":
+                    equipo_dueño = ev.get("teamId")  # equipo AL QUE PERTENECÍA la estructura
+                    building     = ev.get("buildingType", "estructura")
+                    if equipo_dueño == mi_team:
+                        texto = f"[{ts_min}min] Tu equipo perdió una {building}"
+                    else:
+                        texto = f"[{ts_min}min] Tu equipo destruyó una {building} rival"
+
+                if texto:
+                    eventos.append((ts_ms, texto))
+
+        eventos.sort(key=lambda x: x[0])
+        return [t for _, t in eventos]
+    except Exception as e:
+        log(f"extraer_eventos_relevantes: error procesando timeline — {e}")
+        return []
+
+# Colas más comunes — Riot puede agregar/cambiar IDs, si aparece uno nuevo
+# simplemente cae en el fallback "Modo desconocido" sin romper nada.
+QUEUE_ID_A_MODO = {
+    400: "Normal (Draft)",
+    420: "Ranked Solo/Dúo",
+    430: "Normal (Blind)",
+    440: "Ranked Flex",
+    450: "ARAM",
+    900: "URF",
+    1700: "Arena",
+}
+
+def _extraer_stats_de_partida(match_id, detalle, puuid=None, participant_id=None):
+    """
+    Extrae las estadísticas relevantes de un participante dentro de un
+    detalle de partida ya descargado. Se puede identificar al participante
+    por puuid (caso normal) o por participant_id (cuando el jugador eligió
+    manualmente a quién seguir, ej. porque su cuenta no aparece en la partida
+    por el tema del shard desactualizado de Riot).
+    """
+    info = detalle.get("info", {})
+    participantes = info.get("participants", [])
+    if participant_id is not None:
+        yo = next((p for p in participantes if p.get("participantId") == participant_id), None)
+    else:
+        yo = next((p for p in participantes if p.get("puuid") == puuid), None)
+    if not yo:
+        return None
+
+    duracion_min = round(info.get("gameDuration", 0) / 60, 1)
+    items_ids = [yo.get(f"item{i}", 0) for i in range(6)]
+    items_ids = [i for i in items_ids if i and i != 0]
+    modo = QUEUE_ID_A_MODO.get(info.get("queueId"), "Modo desconocido")
+
+    return {
+        "match_id":         match_id,
+        "_detalle_raw":     detalle,
+        "participant_id":   yo.get("participantId"),
+        "campeon":          yo.get("championName", "Desconocido"),
+        "linea":            yo.get("teamPosition", "") or yo.get("individualPosition", ""),
+        "modo":             modo,
+        "victoria":         yo.get("win", False),
+        "kills":            yo.get("kills", 0),
+        "deaths":           yo.get("deaths", 0),
+        "assists":          yo.get("assists", 0),
+        "cs":               yo.get("totalMinionsKilled", 0) + yo.get("neutralMinionsKilled", 0),
+        "duracion_min":     duracion_min,
+        "oro":              yo.get("goldEarned", 0),
+        "daño_campeones":   yo.get("totalDamageDealtToChampions", 0),
+        "daño_recibido":    yo.get("totalDamageTaken", 0),
+        "vision_score":     yo.get("visionScore", 0),
+        "items_ids":        items_ids,
+    }
+
+def obtener_ultima_partida_stats(puuid, routing):
+    """
+    Trae la partida más reciente del jugador (cualquier modo) y devuelve un dict
+    con las estadísticas relevantes de SU participante, o None si falla.
+    """
+    match_ids = obtener_historial(puuid, routing, count=1)
+    if not match_ids:
+        return None
+    match_id = match_ids[0]
+    detalle = obtener_detalle_partida(match_id, routing)
+    if not detalle:
+        return None
+    return _extraer_stats_de_partida(match_id, detalle, puuid=puuid)
+
+def normalizar_match_id(texto_usuario, platform):
+    """
+    Acepta lo que el usuario escriba para identificar una partida y devuelve
+    el match ID completo que espera la API ('EUW1_7921802664').
+    - Si ya viene con prefijo y guion bajo, se respeta tal cual (en mayúsculas).
+    - Si el usuario solo pega el número, se le agrega el prefijo de la
+      plataforma actual (ej. 'EUW1_').
+    """
+    texto = texto_usuario.strip()
+    if not texto:
+        return None
+    if "_" in texto:
+        return texto.upper()
+    return f"{platform.upper()}_{texto}"
+
+def listar_participantes(detalle):
+    """
+    Devuelve una lista legible de los 10 participantes de una partida
+    (campeón, línea, equipo) para que el jugador elija a cuál seguir cuando
+    su propia cuenta no aparece identificada en esa partida.
+    """
+    participantes = detalle.get("info", {}).get("participants", [])
+    lista = []
+    for p in participantes:
+        equipo = "Azul" if p.get("teamId") == 100 else "Rojo"
+        linea = p.get("teamPosition", "") or p.get("individualPosition", "") or "?"
+        lista.append({
+            "participant_id": p.get("participantId"),
+            "campeon":         p.get("championName", "?"),
+            "linea":           linea,
+            "equipo":          equipo,
+        })
+    return sorted(lista, key=lambda x: x["participant_id"])
+
+def obtener_partida_stats_por_id(match_id_usuario, platform, routing, puuid=None, participant_id=None):
+    """
+    Trae y extrae estadísticas de un match ID específico escrito a mano.
+    - Si se identifica al jugador por puuid y SÍ aparece en la partida, listo.
+    - Si NO aparece (cuenta equivocada, shard desactualizado, o simplemente
+      es la partida de otra persona), devuelve la lista de participantes
+      para que el jugador elija manualmente a quién seguir.
+    - Si se pasa participant_id directamente, se usa ese sin más vueltas
+      (caso: el jugador ya eligió de la lista).
+    Devuelve un dict: {"stats": ...} o {"error": "..."} o {"participantes": [...], "match_id": ...}
+    """
+    match_id = normalizar_match_id(match_id_usuario, platform)
+    if not match_id:
+        return {"error": "ID de partida vacío."}
+    detalle = obtener_detalle_partida(match_id, routing)
+    if not detalle:
+        return {"error": f"No encontré la partida '{match_id}'. Verifica el ID o que sea de esta región."}
+
+    if participant_id is not None:
+        stats = _extraer_stats_de_partida(match_id, detalle, participant_id=participant_id)
+        if not stats:
+            return {"error": "No encontré ese número de participante en la partida."}
+        return {"stats": stats}
+
+    stats = _extraer_stats_de_partida(match_id, detalle, puuid=puuid)
+    if stats:
+        return {"stats": stats}
+
+    # No apareces con tu puuid — probablemente el shard de Riot todavía no
+    # reconoce tu cuenta en esta región, o el ID es de otra partida. En vez
+    # de solo fallar, ofrecemos elegir a cuál de los 10 jugadores seguir.
+    return {"participantes": listar_participantes(detalle), "match_id": match_id}
+
+
+def analizar_postgame(stats, items_data=None):
+    """
+    Genera una crítica post-partida en el tono de Forge, basada en las
+    estadísticas finales del partido (no hay timeline, así que la crítica
+    se apoya en proporciones: CS/min, KDA, daño vs oro, visión).
+    """
+    cliente = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    cs_por_min = round(stats["cs"] / stats["duracion_min"], 1) if stats["duracion_min"] > 0 else 0
+    resultado  = "GANASTE" if stats["victoria"] else "PERDISTE"
+
+    nombres_items = []
+    if items_data:
+        for iid in stats["items_ids"]:
+            item_info = items_data.get(str(iid))
+            if item_info:
+                nombres_items.append(item_info.get("name", str(iid)))
+    items_texto = ", ".join(nombres_items) if nombres_items else "sin datos de ítems"
+
+    ctx_perfil = contexto_perfil_para_prompt()
+    extra_perfil = f"\n{ctx_perfil}" if ctx_perfil else ""
+
+    prompt = f"""Eres Forge, un coach de League of Legends analizando una partida ya terminada. Tu tono es directo y filoso, con humor calibrado — no insultos genéricos, sino observaciones jocosas que usan jerga correcta del juego y siempre van pegadas a una instrucción accionable. El chiste nace del error específico, no de insultar por insultar.
+
+Escribe todo en español — sin mezclar términos en inglés. Usa el nombre tal como aparece en el cliente de LoL en español. Si no tienes certeza del nombre oficial en español de algo, no inventes ni dejes el término en inglés: descríbelo por su efecto.
+
+Importante: NO tienes el timeline de la partida (jugadas minuto a minuto), solo el resultado final. No inventes decisiones específicas que no puedes saber ("no rotaste a la torre en el minuto 14") — en su lugar, lee las señales que SÍ tienes (KDA, CS/min, oro, daño hecho vs recibido, visión) y saca conclusiones honestas sobre qué patrón revelan esos números, dejando claro cuando es una inferencia y no un hecho observado.
+
+Esta partida fue en modo {stats['modo']}. Adapta la crítica al modo: en ARAM no hay líneas ni farmeo real de jungla, así que el CS y la visión pesan mucho menos que el daño y la supervivencia en peleas; en Normal o Ranked de Grieta del Invocador sí aplican todas las métricas de línea normalmente.
+{extra_perfil}
+
+Datos de la partida:
+- Modo: {stats['modo']}
+- Campeón: {stats['campeon']} ({stats['linea']})
+- Resultado: {resultado}
+- KDA: {stats['kills']}/{stats['deaths']}/{stats['assists']}
+- CS: {stats['cs']} en {stats['duracion_min']} minutos ({cs_por_min} por minuto)
+- Oro ganado: {stats['oro']}
+- Daño a campeones: {stats['daño_campeones']}
+- Daño recibido: {stats['daño_recibido']}
+- Puntuación de visión: {stats['vision_score']}
+- Build final: {items_texto}
+
+Estructura exacta, sin títulos numerados:
+
+LECTURA GENERAL
+Una o dos líneas sobre qué cuentan estos números en conjunto — ¿fue una partida de farmeo pobre, de exceso de riesgo, de buen impacto en peleas pero mal manejo de línea, etc.? Basado solo en los datos de arriba.
+
+LO QUE MÁS PESÓ
+La única métrica que más explica el resultado (CS/min bajo, muertes altas, visión baja, lo que sea). Explica por qué esa es la señal clave y qué hacer distinto la próxima vez.
+
+PARA LA PRÓXIMA
+Una sola acción concreta y medible para la siguiente partida con este campeón o rol.
+
+PARA MEJORAR
+Una recomendación de práctica o hábito de entrenamiento — no una jugada puntual de la próxima partida, sino algo que se repite y se entrena con el tiempo — ligada directamente al patrón que identificaste en LO QUE MÁS PESÓ. Sé específico: no "mejora tu visión", sino algo medible y repetible que ataque la causa de raíz.
+
+Sin relleno. Sin lista de todas las estadísticas repetidas. Ni un solo término en inglés en toda la respuesta."""
+
+    msg = cliente.messages.create(
+        model=FORGE_MODEL,
+        max_tokens=850,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return limpiar_markdown(msg.content[0].text)
+
+def analizar_postgame_timeline(stats, eventos, items_data=None):
+    """
+    Genera la crítica post-partida usando el timeline completo de eventos
+    (cronología real: wards, muertes, objetivos, compras) en vez de solo el
+    resultado final. Se manda TODO el contexto cronológico en una sola llamada
+    — no fase por fase separada — para que Claude pueda conectar causas con
+    consecuencias (ej. un ward que expiró en el minuto 8 explicando una muerte
+    en el minuto 13).
+    """
+    cliente = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    resultado = "GANASTE" if stats["victoria"] else "PERDISTE"
+
+    nombres_items = []
+    if items_data:
+        for iid in stats["items_ids"]:
+            item_info = items_data.get(str(iid))
+            if item_info:
+                nombres_items.append(item_info.get("name", str(iid)))
+    items_texto = ", ".join(nombres_items) if nombres_items else "sin datos de ítems"
+
+    ctx_perfil = contexto_perfil_para_prompt()
+    extra_perfil = f"\n{ctx_perfil}" if ctx_perfil else ""
+
+    cronologia = "\n".join(eventos) if eventos else "Sin eventos registrados."
+
+    prompt = f"""Eres Forge, un coach de League of Legends analizando una partida ya terminada. Tu tono es directo y filoso, con humor calibrado — no insultos genéricos, sino observaciones jocosas que usan jerga correcta del juego y siempre van pegadas a una instrucción accionable. El chiste nace del error específico, no de insultar por insultar.
+
+Escribe todo en español — sin mezclar términos en inglés. Usa el nombre tal como aparece en el cliente de LoL en español. Si no tienes certeza del nombre oficial en español de algo, no inventes ni dejes el término en inglés: descríbelo por su efecto.
+
+Esta vez SÍ tienes la cronología real de la partida, minuto a minuto — no son estadísticas finales, son los eventos reales en el orden en que pasaron: dónde puso centinelas, cuándo lo mataron, cuándo mató él, qué objetivos se tomaron, qué compró. Úsala para conectar causas con consecuencias: si un centinela puesto en el minuto 8 explica una muerte en el minuto 13, dilo explícitamente. Esa cadena causal es exactamente lo que hace valioso este análisis frente a uno que solo mira el resultado final.
+
+No inventes nada que no esté en la cronología de abajo. Si algo no aparece registrado (ej. posicionamiento exacto en una pelea de equipo), no lo inventes — trabaja con lo que sí tienes.
+
+Esta partida fue en modo {stats['modo']}. Adapta la crítica al modo: en ARAM no hay líneas ni farmeo real de jungla, así que el posicionamiento en peleas pesa más que la visión de línea; en Normal o Ranked de Grieta del Invocador sí aplican todas las dinámicas de línea normalmente.
+{extra_perfil}
+
+Resumen de la partida:
+- Modo: {stats['modo']}
+- Campeón: {stats['campeon']} ({stats['linea']})
+- Resultado: {resultado}
+- KDA: {stats['kills']}/{stats['deaths']}/{stats['assists']}
+- Duración: {stats['duracion_min']} minutos
+- Build final: {items_texto}
+
+Cronología de eventos relevantes para este jugador (orden real, minuto a minuto):
+{cronologia}
+
+Estructura exacta, sin títulos numerados:
+
+LA CADENA
+La secuencia causal más importante de la partida — un error temprano (visión, posicionamiento, timing) que llevó a una consecuencia mayor después. Cita los minutos exactos de la cronología. Si hay más de una cadena así, quédate solo con la más determinante para el resultado.
+
+EL MOMENTO CLAVE
+Un solo evento puntual (una muerte, una pelea, un objetivo perdido) que más cambió el rumbo de la partida, y qué se pudo hacer distinto justo ahí.
+
+PARA LA PRÓXIMA
+Una sola acción concreta y medible para la siguiente partida, ligada directamente a la cadena que identificaste arriba.
+
+PARA MEJORAR
+Una recomendación de práctica o hábito de entrenamiento — no una jugada puntual de la próxima partida, sino algo que se repite y se entrena con el tiempo — que ataque la causa de raíz detrás de LA CADENA que identificaste. Sé específico y medible: qué practicar, cómo, y cómo sabría el jugador que está mejorando en eso.
+
+Sin relleno. Sin repetir toda la cronología. Ni un solo término en inglés en toda la respuesta."""
+
+    msg = cliente.messages.create(
+        model=FORGE_MODEL,
+        max_tokens=1100,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return limpiar_markdown(msg.content[0].text)
 
 def calcular_perfil_jugador(riot_id_completo):
     """
@@ -261,6 +747,8 @@ def calcular_perfil_jugador(riot_id_completo):
         if not puuid:
             return False, f"No encontré la cuenta '{riot_id_completo}'. Verifica el nombre y tag.", False
 
+        guardar_ultimo_riot_id(riot_id_completo)
+
         # Detectar región automáticamente
         platform, routing = detectar_region(puuid)
 
@@ -270,6 +758,8 @@ def calcular_perfil_jugador(riot_id_completo):
         if not summoner:
             perfil_jugador["riot_id"]          = riot_id_completo
             perfil_jugador["puuid"]            = puuid
+            perfil_jugador["platform"]         = platform
+            perfil_jugador["routing"]          = routing
             perfil_jugador["nivel"]            = 1
             perfil_jugador["rango"]            = "Sin rango"
             perfil_jugador["partidas_totales"] = 0
@@ -284,10 +774,12 @@ def calcular_perfil_jugador(riot_id_completo):
         match_ids = obtener_historial(puuid, routing, count=30)
         partidas_totales = len(match_ids)
 
-        # Si no hay historial ranked, ir directo a encuesta sin descargar nada
+        # Si no hay historial de partidas, ir directo a encuesta sin descargar nada
         if partidas_totales == 0:
             perfil_jugador["riot_id"]          = riot_id_completo
             perfil_jugador["puuid"]            = puuid
+            perfil_jugador["platform"]         = platform
+            perfil_jugador["routing"]          = routing
             perfil_jugador["nivel"]            = nivel
             perfil_jugador["rango"]            = rango
             perfil_jugador["partidas_totales"] = 0
@@ -330,6 +822,8 @@ def calcular_perfil_jugador(riot_id_completo):
         # Guardar en estado global
         perfil_jugador["riot_id"]          = riot_id_completo
         perfil_jugador["puuid"]            = puuid
+        perfil_jugador["platform"]         = platform
+        perfil_jugador["routing"]          = routing
         perfil_jugador["nivel"]            = nivel
         perfil_jugador["rango"]            = rango
         perfil_jugador["partidas_totales"] = partidas_totales
@@ -349,23 +843,37 @@ def tiene_perfil():
 
 def contexto_perfil_para_prompt():
     """Genera texto del perfil para inyectar en prompts de Claude"""
-    if not tiene_perfil():
-        return ""
-    p = perfil_jugador
-    lineas = ["Perfil del jugador:"]
-    lineas.append(f"  - Riot ID: {p['riot_id']}")
-    lineas.append(f"  - Nivel: {p['nivel']} | Rango: {p['rango']}")
-    lineas.append(f"  - Tipo: {p['tipo'].upper()}")
-    if p["campeones_top"]:
-        tops = ", ".join([f"{c['nombre']} ({c['partidas']}p, {c['winrate']}%wr)" for c in p["campeones_top"]])
-        lineas.append(f"  - Campeones recientes: {tops}")
-    enc = p.get("encuesta", {})
-    if enc:
-        exp_map    = {"nunca": "nunca jugó LoL", "pc_antes": "jugó LoL PC antes", "wildrift": "jugó Wild Rift"}
-        juegos_map = {"ninguno": "sin experiencia en otros juegos", "moba": "experiencia en otros MOBAs", "rpg": "experiencia en RPGs/estrategia"}
-        lineas.append(f"  - Experiencia: {exp_map.get(enc.get('experiencia_previa',''), enc.get('experiencia_previa',''))}")
-        lineas.append(f"  - Juegos previos: {juegos_map.get(enc.get('juegos_similares',''), enc.get('juegos_similares',''))}")
-        lineas.append(f"  - Línea de interés: {enc.get('linea_preferida','')}")
+    lineas = []
+
+    if tiene_perfil():
+        p = perfil_jugador
+        lineas.append("Perfil del jugador (datos en vivo de Riot API):")
+        lineas.append(f"  - Riot ID: {p['riot_id']}")
+        lineas.append(f"  - Nivel: {p['nivel']} | Rango: {p['rango']}")
+        lineas.append(f"  - Tipo: {p['tipo'].upper()}")
+        if p["campeones_top"]:
+            tops = ", ".join([f"{c['nombre']} ({c['partidas']}p, {c['winrate']}%wr)" for c in p["campeones_top"]])
+            lineas.append(f"  - Campeones recientes: {tops}")
+        enc = p.get("encuesta", {})
+        if enc:
+            exp_map    = {"nunca": "nunca jugó LoL", "pc_antes": "jugó LoL PC antes", "wildrift": "jugó Wild Rift"}
+            juegos_map = {"ninguno": "sin experiencia en otros juegos", "moba": "experiencia en otros MOBAs", "rpg": "experiencia en RPGs/estrategia"}
+            lineas.append(f"  - Experiencia: {exp_map.get(enc.get('experiencia_previa',''), enc.get('experiencia_previa',''))}")
+            lineas.append(f"  - Juegos previos: {juegos_map.get(enc.get('juegos_similares',''), enc.get('juegos_similares',''))}")
+            lineas.append(f"  - Línea de interés: {enc.get('linea_preferida','')}")
+
+    if perfil_manual:
+        maestria = perfil_manual.get("maestria_campeones", [])
+        if maestria:
+            top_maestria = sorted(maestria, key=lambda c: c.get("puntos", 0), reverse=True)[:8]
+            texto_maestria = ", ".join([f"{c['campeon']} ({c['puntos']:,} pts)" for c in top_maestria])
+            lineas.append("Maestría de campeón cargada manualmente (fuente externa, no vive de la API activa ahora mismo):")
+            lineas.append(f"  - {texto_maestria}")
+            nota = perfil_manual.get("nota")
+            if nota:
+                lineas.append(f"  - Nota: {nota}")
+            lineas.append("  - Trata esto como señal de con qué campeones tiene experiencia real el jugador, no como estado actual de su cuenta activa.")
+
     return "\n".join(lineas)
 
 def buscar_campeon(nombre, champions):
@@ -504,6 +1012,7 @@ def CX():            return ANCHO() // 2
 
 version   = get_version()
 champions = get_champions(version)
+items_ddragon = get_items(version)
 
 F_TITLE    = tkfont.Font(family="Georgia", size=36, weight="bold")
 F_SUBTITLE = tkfont.Font(family="Georgia", size=13)
@@ -757,14 +1266,7 @@ def actualizar_barra(modulo_activo="inicio"):
                              width=btn_w, height=btn_h, tags="barra")
 
     hacer_btn("PRE-GAME", mostrar_pregame, CX() - espaciado, es_activo=(modulo_activo == "pregame"))
-
-    btn_post = tk.Button(
-        canvas, text="POST-GAME", font=F_BTN_MENU,
-        bg=COLOR_BLOQUEADO, fg=COLOR_BLOQUEADO_TXT,
-        relief="flat", cursor="arrow", state="disabled"
-    )
-    canvas.create_window(CX() + espaciado, cy, anchor="center", window=btn_post,
-                         width=btn_w, height=btn_h, tags="barra")
+    hacer_btn("POST-GAME", mostrar_postgame, CX() + espaciado, es_activo=(modulo_activo == "postgame"))
 
     canvas.tag_raise("barra")
 
@@ -821,6 +1323,19 @@ def mostrar_inicio():
                            font=F_SUBTITLE, fill=COLOR_SUBT, tags="ui")
         _mostrar_input_riot_id(y_bloque + 10)
 
+    # --- HISTORIAL RECIENTE (tipo "búsquedas recientes") ---
+    historial = cargar_historial_uso()
+    if historial:
+        y_hist = y_bloque + 100
+        canvas.create_text(CX(), y_hist,
+                           text="Recientes", font=F_SUB, fill=COLOR_SUBT, tags="ui")
+        etiqueta = {"pregame": "Pre-Game", "postgame": "Post-Game"}
+        for i, entrada in enumerate(historial[:4]):
+            tipo_txt = etiqueta.get(entrada.get("tipo"), "")
+            texto_linea = f"{entrada.get('fecha','')}  ·  {tipo_txt}: {entrada.get('texto','')}"
+            canvas.create_text(CX(), y_hist + 22 + i * 20,
+                               text=texto_linea, font=F_SMALL, fill=COLOR_SUBT, tags="ui")
+
     if tiene_contexto():
         canvas.create_text(CX(), int(ALTO_UTIL() * 0.88),
                            text=f"Partida activa: {resumen_contexto()}",
@@ -838,11 +1353,13 @@ def _mostrar_input_riot_id(y):
         insertbackground=COLOR_TEXTO, relief="flat",
         highlightthickness=1, highlightbackground="#2a2a3e", highlightcolor="#4a7abf"
     ))
-    entry_riot.insert(0, perfil_jugador["riot_id"] or "")
-    entry_riot.config(fg=COLOR_SUBT if not perfil_jugador["riot_id"] else COLOR_TEXTO)
+    # Prioridad: perfil ya cargado en esta sesión > último ID recordado > vacío
+    valor_inicial = perfil_jugador["riot_id"] or cargar_ultimo_riot_id()
+    entry_riot.insert(0, valor_inicial or "")
+    entry_riot.config(fg=COLOR_SUBT if not valor_inicial else COLOR_TEXTO)
 
     # Placeholder
-    if not perfil_jugador["riot_id"]:
+    if not valor_inicial:
         entry_riot.insert(0, "Nombre#TAG")
         def on_focus_in(e):
             if entry_riot.get() == "Nombre#TAG":
@@ -1226,6 +1743,230 @@ def mostrar_pregame():
 
 
 # ============================================
+# PANTALLA POST-GAME
+# ============================================
+def mostrar_postgame():
+    limpiar_pantalla()
+    _pantalla_activa["fn"] = mostrar_postgame
+    actualizar_barra("postgame")
+
+    canvas.create_text(CX(), int(ALTO_UTIL() * 0.08),
+                       text="POST-GAME", font=F_TITLE,
+                       fill=COLOR_TEXTO, tags="ui")
+
+    if not tiene_perfil():
+        canvas.create_text(CX(), int(ALTO_UTIL() * 0.20),
+                           text="Necesitas cargar tu Riot ID desde la pantalla de inicio\npara revisar tu última partida.",
+                           font=F_SUBTITLE, fill=COLOR_WARN, tags="ui", justify="center")
+        canvas.tag_raise("ui")
+        canvas.tag_raise("barra")
+        return
+
+    canvas.create_text(CX(), int(ALTO_UTIL() * 0.14),
+                       text=f"Cuenta cargada: {perfil_jugador['riot_id']}",
+                       font=F_SUBTITLE, fill=COLOR_SUBT, tags="ui")
+
+    canvas.create_text(CX(), int(ALTO_UTIL() * 0.185),
+                       text="ID de partida específica (opcional) — déjalo vacío para tu última partida",
+                       font=F_SUB, fill=COLOR_SUBT, tags="ui")
+
+    entry_match_id = registrar(tk.Entry(
+        canvas, font=F_BODY,
+        bg=COLOR_ENTRY_BG, fg=COLOR_TEXTO,
+        insertbackground=COLOR_TEXTO, relief="flat",
+        highlightthickness=1, highlightbackground="#2a2a3e", highlightcolor="#4a7abf",
+        justify="center"
+    ))
+    canvas.create_window(CX(), int(ALTO_UTIL() * 0.225), anchor="center",
+                         window=entry_match_id, width=320, height=32, tags="ui")
+
+    boton = registrar(tk.Button(
+        canvas, text="Analizar Partida", font=F_BTN,
+        bg=COLOR_BTN, fg=COLOR_TEXTO,
+        activebackground=COLOR_BTN_HOV, activeforeground=COLOR_TEXTO,
+        relief="flat", cursor="hand2", width=24, height=2
+    ))
+    boton.bind("<Enter>", lambda e: boton.config(bg=COLOR_BTN_HOV))
+    boton.bind("<Leave>", lambda e: boton.config(bg=COLOR_BTN))
+    canvas.create_window(CX(), int(ALTO_UTIL() * 0.32), anchor="center", window=boton, tags="ui")
+
+    y_resultado = int(ALTO_UTIL() * 0.40)
+    alto_resultado = int(ALTO_UTIL() * 0.40)
+    resultado_texto = registrar(tk.Text(
+        canvas, font=F_BODY,
+        bg=COLOR_ENTRY_BG, fg=COLOR_TEXTO,
+        relief="flat", wrap="word", padx=16, pady=16
+    ))
+    resultado_texto.insert("1.0", "Dale click a \"Analizar Partida\" para revisar qué pasó — sin adornos.\n\nDeja el campo de ID vacío para analizar tu última partida, o pega un ID específico para revisar esa en concreto.")
+    resultado_texto.configure(state="disabled")
+    canvas.create_window(CX(), y_resultado + alto_resultado // 2,
+                         anchor="center", window=resultado_texto,
+                         width=int(ANCHO() * 0.6),
+                         height=alto_resultado, tags="ui")
+
+    y_seleccion = y_resultado + alto_resultado + 30
+
+    # Fila de selección manual de participante — se queda oculta hasta que
+    # una partida no reconozca al jugador y ofrezcamos elegir a quién seguir.
+    entry_seleccion = registrar(tk.Entry(
+        canvas, font=F_BODY,
+        bg=COLOR_ENTRY_BG, fg=COLOR_TEXTO,
+        insertbackground=COLOR_TEXTO, relief="flat",
+        highlightthickness=1, highlightbackground="#2a2a3e", highlightcolor="#4a7abf",
+        justify="center"
+    ))
+    boton_seleccion = registrar(tk.Button(
+        canvas, text="Seguir a este jugador", font=F_BTN,
+        bg=COLOR_BTN, fg=COLOR_TEXTO,
+        activebackground=COLOR_BTN_HOV, activeforeground=COLOR_TEXTO,
+        relief="flat", cursor="hand2"
+    ))
+    boton_seleccion.bind("<Enter>", lambda e: boton_seleccion.config(bg=COLOR_BTN_HOV))
+    boton_seleccion.bind("<Leave>", lambda e: boton_seleccion.config(bg=COLOR_BTN))
+
+    win_entry_sel  = canvas.create_window(CX() - 90, y_seleccion, anchor="center",
+                                          window=entry_seleccion, width=110, height=30, tags="ui", state="hidden")
+    win_boton_sel  = canvas.create_window(CX() + 60, y_seleccion, anchor="center",
+                                          window=boton_seleccion, width=200, height=34, tags="ui", state="hidden")
+
+    contexto_seleccion = {"participantes": [], "match_id": None}
+
+    def mostrar_selector(visible):
+        estado = "normal" if visible else "hidden"
+        canvas.itemconfigure(win_entry_sel, state=estado)
+        canvas.itemconfigure(win_boton_sel, state=estado)
+
+    boton.config(command=lambda: analizar_partida_ui(
+        boton, resultado_texto, entry_match_id, contexto_seleccion, mostrar_selector, entry_seleccion
+    ))
+    boton_seleccion.config(command=lambda: confirmar_seleccion_participante(
+        boton, resultado_texto, entry_seleccion, contexto_seleccion, mostrar_selector
+    ))
+
+    canvas.tag_raise("ui")
+    canvas.tag_raise("barra")
+
+
+# ============================================
+# LÓGICA POST-GAME
+# ============================================
+def _formatear_lista_participantes(participantes):
+    lineas = ["No encontré tu cuenta en esta partida (puede ser el tema del shard de Riot, o es la partida de alguien más).",
+              "", "Elige a quién seguir escribiendo su número abajo:"]
+    for i, p in enumerate(participantes, start=1):
+        lineas.append(f"  {i}. {p['campeon']} — {p['linea']} — Equipo {p['equipo']}")
+    return "\n".join(lineas)
+
+def _ejecutar_analisis_completo(stats, routing, resultado_texto, boton):
+    """Trae el timeline, arma el análisis, y lo muestra — reutilizado por
+    el flujo normal y por el flujo de selección manual de participante."""
+    app.after(0, lambda: _set_resultado(resultado_texto, "Partida encontrada. Trayendo la cronología minuto a minuto..."))
+
+    texto = None
+    timeline = obtener_timeline_partida(stats["match_id"], routing)
+    if timeline:
+        eventos = extraer_eventos_relevantes(timeline, stats["_detalle_raw"], stats["participant_id"], items_ddragon)
+        if eventos:
+            log(f"_ejecutar_analisis_completo: timeline OK, {len(eventos)} eventos relevantes")
+            texto = analizar_postgame_timeline(stats, eventos, items_ddragon)
+
+    if not texto:
+        log("_ejecutar_analisis_completo: timeline no disponible, usando fallback de estadísticas finales")
+        texto = analizar_postgame(stats, items_ddragon)
+
+    resultado_txt = "Victoria" if stats["victoria"] else "Derrota"
+    guardar_entrada_historial("postgame", f"{stats['campeon']} ({stats['linea']}) — {resultado_txt}")
+
+    app.after(0, lambda: [
+        _set_resultado(resultado_texto, texto),
+        boton.config(state="normal"),
+    ])
+
+def analizar_partida_ui(boton, resultado_texto, entry_match_id, contexto_seleccion, mostrar_selector, entry_seleccion):
+    match_id_usuario = entry_match_id.get().strip()
+    boton.config(state="disabled")
+    mostrar_selector(False)
+    entry_seleccion.delete(0, "end")
+
+    def tarea():
+        try:
+            routing  = perfil_jugador.get("routing")  or _region_routing
+            platform = perfil_jugador.get("platform") or _region_platform
+
+            if match_id_usuario:
+                app.after(0, lambda: _set_resultado(resultado_texto, f"Buscando la partida '{match_id_usuario}'..."))
+                resultado = obtener_partida_stats_por_id(match_id_usuario, platform, routing, puuid=perfil_jugador["puuid"])
+            else:
+                app.after(0, lambda: _set_resultado(resultado_texto, "Buscando tu última partida..."))
+                stats_ultima = obtener_ultima_partida_stats(perfil_jugador["puuid"], routing)
+                resultado = {"stats": stats_ultima} if stats_ultima else {"error": "No encontré partidas recientes en tu cuenta para analizar."}
+
+            if resultado.get("error"):
+                app.after(0, lambda: [
+                    _set_resultado(resultado_texto, resultado["error"]),
+                    boton.config(state="normal"),
+                ])
+                return
+
+            if resultado.get("participantes"):
+                contexto_seleccion["participantes"] = resultado["participantes"]
+                contexto_seleccion["match_id"] = resultado["match_id"]
+                texto_lista = _formatear_lista_participantes(resultado["participantes"])
+                app.after(0, lambda: [
+                    _set_resultado(resultado_texto, texto_lista),
+                    boton.config(state="normal"),
+                    mostrar_selector(True),
+                ])
+                return
+
+            stats = resultado["stats"]
+            _ejecutar_analisis_completo(stats, routing, resultado_texto, boton)
+        except Exception as e:
+            msg = str(e)
+            app.after(0, lambda: [
+                _set_resultado(resultado_texto, f"Error analizando la partida: {msg}"),
+                boton.config(state="normal"),
+            ])
+
+    threading.Thread(target=tarea, daemon=True).start()
+
+def confirmar_seleccion_participante(boton, resultado_texto, entry_seleccion, contexto_seleccion, mostrar_selector):
+    texto_num = entry_seleccion.get().strip()
+    participantes = contexto_seleccion.get("participantes", [])
+    if not texto_num.isdigit() or not (1 <= int(texto_num) <= len(participantes)):
+        _set_resultado(resultado_texto, f"Escribe un número entre 1 y {len(participantes)}.")
+        return
+
+    elegido = participantes[int(texto_num) - 1]
+    match_id = contexto_seleccion["match_id"]
+    boton.config(state="disabled")
+    mostrar_selector(False)
+    _set_resultado(resultado_texto, f"Analizando a {elegido['campeon']} ({elegido['linea']})...")
+
+    def tarea():
+        try:
+            routing = perfil_jugador.get("routing") or _region_routing
+            platform = perfil_jugador.get("platform") or _region_platform
+            resultado = obtener_partida_stats_por_id(match_id, platform, routing, participant_id=elegido["participant_id"])
+            if resultado.get("error"):
+                app.after(0, lambda: [
+                    _set_resultado(resultado_texto, resultado["error"]),
+                    boton.config(state="normal"),
+                ])
+                return
+            stats = resultado["stats"]
+            _ejecutar_analisis_completo(stats, routing, resultado_texto, boton)
+        except Exception as e:
+            msg = str(e)
+            app.after(0, lambda: [
+                _set_resultado(resultado_texto, f"Error analizando la partida: {msg}"),
+                boton.config(state="normal"),
+            ])
+
+    threading.Thread(target=tarea, daemon=True).start()
+
+
+# ============================================
 # LÓGICA PRE-GAME
 # ============================================
 def mostrar_sugerencias(texto, input_widget, frame, lado, linea_var=None):
@@ -1311,6 +2052,7 @@ def analizar(input_mi_campeon, input_enemigo, linea_var, boton, resultado_texto)
 
     def tarea():
         rec = recomendar_build(mi_campeon, campeon_enemigo, linea)
+        guardar_entrada_historial("pregame", f"{mi_campeon['nombre']} vs {campeon_enemigo['nombre']} ({linea})")
         app.after(0, lambda: [_set_resultado(resultado_texto, rec), boton.config(state="normal")])
 
     threading.Thread(target=tarea, daemon=True).start()
